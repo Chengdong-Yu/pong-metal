@@ -6,13 +6,13 @@
 #include <string.h>
 
 /* Guest metadata, described by describe-pong-metal-abi.py: _MTLDevice
- * is 528 bytes on 20G81 and 600 on 22H374. No private superclass ivars are written.
+ * is 528 bytes on20G81 and600 on22H374/22G100. No private superclass ivars are written.
  * New methods use the target's own Objective-C dispatch and public Metal ABI.
  */
 static bool PongMetalDeviceAbiAvailable(Class base)
 {
-#if PONG_GUEST_22H374
-    constexpr size_t extent=600; // actual 22H374 _MTLDevice metadata
+#if PONG_GUEST_DARWIN24 || PONG_GUEST_22H374 || PONG_GUEST_22G100
+    constexpr size_t extent=600; // actual selected Darwin24 _MTLDevice metadata
 #else
     constexpr size_t extent=528; // actual 20G81 metadata
 #endif

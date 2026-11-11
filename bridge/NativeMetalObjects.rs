@@ -10,18 +10,20 @@ use metal2vulkan::library::{FunctionConstantValue, FunctionConstantValues};
 use metal2vulkan::metal::{
     BlendFactor, BlendOperation, ColorWriteMask, CompareFunction, CullMode, DataType, IndexType, PixelFormat, PrimitiveTopologyClass,
     PrimitiveType, RenderStages, ResourceUsage, BarrierScope, SamplerAddressMode, SamplerBorderColor, SamplerMinMagFilter, SamplerMipFilter, StencilOperation, TextureType,
+    TessellationControlPointIndexType, TessellationFactorFormat, TessellationFactorStepFunction, TessellationPartitionMode,
     TextureUsage, TextureSwizzle, TextureSwizzleChannels, TriangleFillMode, VertexFormat, VertexStepFunction, Winding,
 };
 use metal2vulkan::pipeline::{
-    ColorAttachmentDescriptor, ComputePipelineDescriptor, RenderPipelineDescriptor, StageSource, VertexAttributeDescriptor, VertexBufferLayoutDescriptor,
-    VertexDescriptor,
+    ColorAttachmentDescriptor, ComputePipelineDescriptor, LinkedFunction, LinkedFunctions, RenderPipelineDescriptor, StageSource, VertexAttributeDescriptor, VertexBufferLayoutDescriptor,
+    VertexDescriptor, TessellationDescriptor,
 };
 use metal2vulkan_runtime::{
     BinaryArchive, BinaryArchiveDescriptor, BlitCommandEncoder, FamilyRow, FeatureRow, GpuFamily, RowState, BlitOption, Buffer, ClearColor, CommandBuffer, CommandQueue, ComputeCommandEncoder,
     ComputePipelineState, Deallocator, DebugMessage, DepthStencilState, Device, DeviceOptions, MessageSeverity, MessageSink, Event, EventRef, Fence, Function, Heap, HeapDescriptor, HeapType, HostMemory, IoSurfacePlane, IoSurfaceYCbCr, Library, LoadAction,
     Origin, PipelineOption, PipelineOptions, PurgeableState, PrivateCount, PrivateFlag, PrivateProperties, MAX_COLOR_ATTACHMENTS, Region, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState, ResourceOptions, ResourceRef,
-    SamplerState, ScissorRect, SharedEvent, SharedEventListener, Size, StoreAction, SurfaceYCbCrMatrix, Texture, TextureDescriptor, Viewport, VisibilityResultMode, MultisampleDepthResolveFilter, MultisampleStencilResolveFilter,
+    SamplerState, ScissorRect, SharedEvent, SharedEventListener, Size, StoreAction, SurfaceYCbCrMatrix, Texture, TextureDescriptor, Viewport, VisibilityResultMode, MultisampleDepthResolveFilter, MultisampleStencilResolveFilter, VertexAmplificationViewMapping,
 };
+use metal2vulkan_runtime::{CommandBufferError, FailureOrigin};
 use std::cell::RefCell;
 use std::ffi::{c_char, c_void, CStr};
 use std::path::PathBuf;
@@ -115,7 +117,7 @@ pub extern "C" fn nmb_last_error() -> *const c_char {
 
 // ---- device ----
 
-pub struct NmbDevice(Device, std::sync::OnceLock<PrivateProperties>, std::sync::Mutex<()>);
+pub struct NmbDevice(Device, std::sync::OnceLock<PrivateProperties>, std::sync::Mutex<NoCopyPages>);
 
 impl NmbDevice {
     /// The runtime judges the private properties by the family rows once.
@@ -152,7 +154,7 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         options.messages = Some(MessageSink::new(observe_message));
         let device=Device::system_default_with(&options).map_err(e("device"))?;
         device.refuse_rebinds();
-        Ok(boxed(NmbDevice(device, std::sync::OnceLock::new(), std::sync::Mutex::new(()))))
+        Ok(boxed(NmbDevice(device, std::sync::OnceLock::new(), std::sync::Mutex::new(NoCopyPages::default()))))
     })
 }
 
@@ -571,12 +573,101 @@ pub unsafe extern "C" fn nmb_buffer_new_no_copy_releasing(device: *mut NmbDevice
     unsafe { no_copy(device, pointer, length, options_word, deallocator) }
 }
 
+/// The pages each no-copy range had when a buffer was last made over exactly it (`pages_identity`), under the device's no-copy gate.
+/// The runtime puts a no-copy buffer over exactly the bytes a live one was made over in that one's import, so over the pages that
+/// were there then (`host_aliases.rs`); Metal wires the pages at the address when it makes each buffer. CoreAnimation's render
+/// server maps a client's new shared memory (and IOSurfaces) where an earlier one was while its no-copy buffers still live in its
+/// caches: the GPU drew the earlier pages, another text mask in a label's place (GFXBench's test list; Metal Check case 40).
+#[derive(Default)]
+pub struct NoCopyPages {
+    seen: std::collections::HashMap<(u64, u64), u64>,
+    /// Whether `seen` was ever emptied to bound it: a range without a note may then have a live buffer over it.
+    forgot: bool,
+}
+
+const NO_COPY_RANGES_NOTED: usize = 8192;
+/// Ranges checked, and ranges whose pages had changed (reported to the runtime as remapped).
+static NO_COPY_REMAPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// What the pages under `length` bytes at `start` are, as the kernel names them: for each map entry over the range, the leaf VM
+/// object's (hashed) id and the object offset at the range's first byte in it. A remap puts other objects there, and the object of
+/// pages a live import pinned outlives the remap (the import holds it), so no new object takes its id while it lives. `None` where
+/// a page has no object yet (memory never touched, so not what a live import pinned) or the range is not all mapped.
+#[cfg(target_vendor = "apple")]
+fn pages_identity(start: u64, length: u64) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    // vm_region_submap_short_info_64 (mach/vm_region.h, packed to 4).
+    #[repr(C, packed(4))]
+    #[derive(Default)]
+    struct Region {
+        protection: i32,
+        max_protection: i32,
+        inheritance: u32,
+        offset: u64,
+        user_tag: u32,
+        ref_count: u32,
+        shadow_depth: u16,
+        external_pager: u8,
+        share_mode: u8,
+        is_submap: i32,
+        behavior: i32,
+        object_id: u32,
+        user_wired_count: u16,
+    }
+    unsafe extern "C" {
+        static mach_task_self_: u32;
+        fn mach_vm_region_recurse(task: u32, address: *mut u64, size: *mut u64, depth: *mut u32, info: *mut i32, count: *mut u32) -> i32;
+    }
+    let end = start.checked_add(length)?;
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    let mut at = start;
+    while at < end {
+        let (mut address, mut size, mut depth) = (at, 0u64, 64u32);
+        let mut region = Region::default();
+        let mut count = (std::mem::size_of::<Region>() / 4) as u32;
+        // SAFETY: the out-parameters are this frame's, `count` words of `region`; the call reads no memory of the range.
+        let status = unsafe {
+            mach_vm_region_recurse(mach_task_self_, &mut address, &mut size, &mut depth, (&raw mut region).cast(), &mut count)
+        };
+        let (object, offset) = (region.object_id, region.offset);
+        if status != 0 || address > at || object == 0 {
+            return None;
+        }
+        (at, object, offset + (at - address)).hash(&mut hash);
+        let following=address.checked_add(size)?;
+        if following<=at {return None;}
+        at=following;
+    }
+    Some(hash.finish())
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn pages_identity(_: u64, _: u64) -> Option<u64> {
+    None
+}
+
+/// Ranges checked and ranges found remapped since the device opened (`NoCopyPages`).
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_no_copy_remaps(out: *mut u64) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if out.is_null() {
+        return false;
+    }
+    // SAFETY: the header's two words.
+    let out = unsafe { std::slice::from_raw_parts_mut(out, 2) };
+    out[0] = NO_COPY_REMAPS[0].load(Relaxed);
+    out[1] = NO_COPY_REMAPS[1].load(Relaxed);
+    true
+}
+
 unsafe fn no_copy(device: *mut NmbDevice, pointer: *mut c_void, length: u64, options_word: u64, deallocator: Option<Deallocator>)
                   -> *mut NmbBuffer {
     guard(std::ptr::null_mut(), || {
         let device = get(device)?;
         // SAFETY: the caller's contract.
-        let memory = unsafe { HostMemory::new(NonNull::new(pointer as *mut u8).ok_or("null memory")?) };
+        let base = NonNull::new(pointer as *mut u8).ok_or("null memory")?;
+        // SAFETY: the caller's contract.
+        let memory = unsafe { HostMemory::new(base) };
         let modes = options(options_word)?;
         // The runtime's live-import lookup and subsequent join are separate:
         // simultaneous first constructors can allocate distinct imports of the
@@ -586,10 +677,39 @@ unsafe fn no_copy(device: *mut NmbDevice, pointer: *mut c_void, length: u64, opt
         // only when an import is freed, never under this gate. Drop it before
         // returning/formatting a failure; GPU work and resource release never
         // take it. A device's unrelated APIs and other devices remain separate.
+        // The gate also holds each range's pages when a buffer was last made over it: pages other than those now (a remap) are
+        // reported to the runtime first, so the buffer imports the pages at the address instead of joining a live import of the
+        // earlier ones (`NoCopyPages`).
         let buffer = {
-            let _gate = device.2.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            use std::sync::atomic::Ordering::Relaxed;
+            let mut gate = device.2.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let range = (pointer as u64, length);
+            let now = pages_identity(range.0, range.1);
+            let changed = match gate.seen.get(&range) {
+                Some(&noted) => now != Some(noted),
+                None => gate.forgot || now.is_none(),
+            };
+            NO_COPY_REMAPS[0].fetch_add(1, Relaxed);
+            if changed {
+                NO_COPY_REMAPS[1].fetch_add(1, Relaxed);
+                device.0.host_range_remapped(base, length);
+            }
             // SAFETY: as above.
-            unsafe { device.0.new_buffer_with_bytes_no_copy(memory, length, modes, deallocator) }
+            let buffer = unsafe { device.0.new_buffer_with_bytes_no_copy(memory, length, modes, deallocator) };
+            // Noted as they are once the buffer pinned them (pinning for writing may give the range objects of its own).
+            match (&buffer, pages_identity(range.0, range.1)) {
+                (Ok(_), Some(pages)) => {
+                    if gate.seen.len() >= NO_COPY_RANGES_NOTED && !gate.seen.contains_key(&range) {
+                        gate.seen.clear();
+                        gate.forgot = true;
+                    }
+                    gate.seen.insert(range, pages);
+                }
+                _ => {
+                    gate.seen.remove(&range);
+                }
+            }
+            buffer
         };
         Ok(boxed(NmbBuffer(buffer.map_err(e("no-copy buffer"))?)))
     })
@@ -723,6 +843,9 @@ pub struct NmbTextureDescriptor {
     pub usage: u64,
     pub options: u64,
     pub swizzle: u64,
+    pub rotation: u64,
+    pub framebuffer_only: u64,
+    pub is_drawable: u64,
 }
 
 // Bit 32 distinguishes an explicit all-zero swizzle from an omitted descriptor field.
@@ -749,6 +872,9 @@ fn texture_descriptor(d: *const NmbTextureDescriptor) -> Result<TextureDescripto
     out.array_length = d.array_length;
     out.usage = raw::<TextureUsage>(d.usage, "texture usage")?;
     out.resource_options = options(d.options)?;
+    out.rotation=d.rotation;
+    out.framebuffer_only=d.framebuffer_only!=0;
+    out.is_drawable=d.is_drawable!=0;
     if let Some(swizzle) = swizzle_of(d.swizzle)? { out.swizzle = swizzle; }
     Ok(out)
 }
@@ -913,6 +1039,9 @@ pub extern "C" fn nmb_texture_describe(texture: *const NmbTexture, out: *mut Nmb
             usage: t.usage().as_raw() as u64,
             options: t.resource_options().raw(),
             swizzle: swizzle_packed(t.swizzle()),
+            rotation:t.rotation(),
+            framebuffer_only:u64::from(t.framebuffer_only()),
+            is_drawable:u64::from(t.is_drawable()),
         };
         Ok(())
     })
@@ -1140,11 +1269,31 @@ pub struct NmbComputePipelineDescriptor {
     pub max_call_stack_depth: u64,
     pub adding_binary_functions: u64,
     pub mutability: [u64; 31],
+    pub linked: *const *mut NmbFunction,
+    pub linked_count: u64,
+    pub private_linked: *const *mut NmbFunction,
+    pub private_linked_count: u64,
+}
+
+/// The linked functions of a counted array of live function handles.
+fn linked_list(functions: *const *mut NmbFunction, count: u64) -> Result<Vec<LinkedFunction>, String> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if functions.is_null() {
+        return Err("null linked functions".into());
+    }
+    // SAFETY: the caller's contract: `count` live handles.
+    let handles = unsafe { std::slice::from_raw_parts(functions, usize::try_from(count).map_err(e("linked function count"))?) };
+    handles.iter().map(|&function| Ok(get(function)?.0.linked_function())).collect()
 }
 
 fn compute_descriptor(descriptor: *const NmbComputePipelineDescriptor) -> Result<ComputePipelineDescriptor, String> {
     let d = get(descriptor)?;
-    let mut out = ComputePipelineDescriptor::new(StageSource::Function(get(d.function)?.0.function_descriptor()));
+    let mut linked = LinkedFunctions::new();
+    linked.functions=linked_list(d.linked,d.linked_count)?;
+    linked.private_functions=linked_list(d.private_linked,d.private_linked_count)?;
+    let mut out=ComputePipelineDescriptor::new(StageSource::Function(get(d.function)?.0.function_descriptor().with_linked(linked)));
     out.max_total_threads_per_threadgroup = if d.max_threads == 0 { None } else { Some(u32::try_from(d.max_threads).map_err(e("compute max threads"))?) };
     out.threadgroup_size_is_multiple_of_execution_width = d.multiple_of_execution_width != 0;
     out.support_indirect_command_buffers = d.indirect != 0;
@@ -1225,6 +1374,16 @@ pub struct NmbRenderPipelineDescriptor {
     pub vertex_inputs: u64,
     pub attributes: [NmbVertexAttribute; 31],
     pub layouts: [NmbVertexLayout; 31],
+    pub vertex_linked: *const *mut NmbFunction,
+    pub vertex_linked_count: u64,
+    pub vertex_private_linked: *const *mut NmbFunction,
+    pub vertex_private_linked_count: u64,
+    pub fragment_linked: *const *mut NmbFunction,
+    pub fragment_linked_count: u64,
+    pub fragment_private_linked: *const *mut NmbFunction,
+    pub fragment_private_linked_count: u64,
+    pub max_vertex_amplification_count: u64,
+    pub tessellation: NmbTessellation,
 }
 
 fn optional_format(value: u64) -> Result<Option<PixelFormat>, String> {
@@ -1278,9 +1437,19 @@ pub unsafe extern "C" fn nmb_render_pipeline_new_with_options(device: *mut NmbDe
 
 fn render_descriptor(descriptor: *const NmbRenderPipelineDescriptor) -> Result<RenderPipelineDescriptor, String> {
         let d = get(descriptor)?;
-        let mut out = RenderPipelineDescriptor::new(StageSource::Function(get(d.vertex)?.0.function_descriptor()));
+        let stage_linked = |functions, count, private, private_count| -> Result<LinkedFunctions, String> {
+            let mut linked = LinkedFunctions::new();
+            linked.functions = linked_list(functions, count)?;
+            linked.private_functions = linked_list(private, private_count)?;
+            Ok(linked)
+        };
+        let vertex = get(d.vertex)?.0.function_descriptor()
+            .with_linked(stage_linked(d.vertex_linked, d.vertex_linked_count, d.vertex_private_linked, d.vertex_private_linked_count)?);
+        let mut out = RenderPipelineDescriptor::new(StageSource::Function(vertex));
         if !d.fragment.is_null() {
-            out.fragment = Some(StageSource::Function(get(d.fragment)?.0.function_descriptor()));
+            let fragment = get(d.fragment)?.0.function_descriptor().with_linked(stage_linked(
+                d.fragment_linked, d.fragment_linked_count, d.fragment_private_linked, d.fragment_private_linked_count)?);
+            out.fragment = Some(StageSource::Function(fragment));
         }
         for (slot, c) in out.color_attachments.iter_mut().zip(d.colors.iter()) {
             if c.format == 0 {
@@ -1300,8 +1469,24 @@ fn render_descriptor(descriptor: *const NmbRenderPipelineDescriptor) -> Result<R
         out.depth_format = optional_format(d.depth_format)?;
         out.stencil_format = optional_format(d.stencil_format)?;
         out.raster_sample_count = d.samples.max(1) as u32;
+        out.max_vertex_amplification_count = u32::try_from(d.max_vertex_amplification_count.max(1))
+            .map_err(|_| "vertex amplification count exceeds u32")?;
         out.input_primitive_topology = raw::<PrimitiveTopologyClass>(d.topology, "topology")?;
         out.rasterization_enabled = d.rasterization != 0;
+        let t = &d.tessellation;
+        if t.tessellates != 0 {
+            let mut tessellation = TessellationDescriptor::default();
+            tessellation.max_tessellation_factor = u32::try_from(t.max_factor).map_err(|_| "tessellation factor".to_string())?;
+            tessellation.partition_mode = raw::<TessellationPartitionMode>(t.partition_mode, "partition mode")?;
+            tessellation.factor_format = raw::<TessellationFactorFormat>(t.factor_format, "factor format")?;
+            tessellation.factor_step_function = raw::<TessellationFactorStepFunction>(t.factor_step_function, "factor step function")?;
+            tessellation.output_winding_order = raw::<Winding>(t.output_winding, "output winding")?;
+            tessellation.control_point_index_type = raw::<TessellationControlPointIndexType>(t.control_point_index_type,
+                                                                                             "control point index type")?;
+            tessellation.factor_scale_enabled = t.factor_scale_enabled != 0;
+            out.tessellation = Some(tessellation);
+        }
+
         if d.vertex_inputs != 0 {
             let mut inputs = VertexDescriptor::new();
             for (i, a) in d.attributes.iter().enumerate() {
@@ -1325,6 +1510,187 @@ fn render_descriptor(descriptor: *const NmbRenderPipelineDescriptor) -> Result<R
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_render_pipeline_release(pipeline: *mut NmbRenderPipeline) {
     release(pipeline)
+}
+
+// ---- pipeline reflection ----
+
+/// A pipeline's reflection, as the `reflection:` out-parameter of a pipeline's creation answers it, in JSON for the frontend's
+/// MTLArgument/MTLBinding objects: Metal's raw enumeration values, and a buffer's struct, array, pointer and texture reference types
+/// nested as Metal nests them. GFXBench's NGL engine (Aztec Ruins) finds every uniform's buffer offset and every texture's index in it.
+pub struct NmbReflection(std::ffi::CString);
+
+mod reflection_json {
+    use metal2vulkan::reflection::{ArrayType, Binding, PointerType, StructType, TextureReferenceType};
+    use std::fmt::Write;
+
+    fn string(out: &mut String, s: &str) {
+        out.push('"');
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                c if (c as u32) < 0x20 => {
+                    let _ = write!(out, "\\u{:04x}", c as u32);
+                }
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+    }
+
+    fn structure(out: &mut String, s: &StructType) {
+        out.push_str("{\"members\":[");
+        for (i, m) in s.members().iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str("{\"name\":");
+            string(out, m.name());
+            let _ = write!(out, ",\"offset\":{},\"dataType\":{},\"argumentIndex\":{}", m.offset(), m.data_type().as_raw(), m.argument_index());
+            if let Some(t) = m.struct_type() {
+                out.push_str(",\"struct\":");
+                structure(out, t);
+            }
+            if let Some(t) = m.array_type() {
+                out.push_str(",\"array\":");
+                array(out, t);
+            }
+            if let Some(t) = m.pointer_type() {
+                out.push_str(",\"pointer\":");
+                pointer(out, t);
+            }
+            if let Some(t) = m.texture_reference_type() {
+                out.push_str(",\"texture\":");
+                texture_reference(out, t);
+            }
+            out.push('}');
+        }
+        out.push_str("]}");
+    }
+
+    fn array(out: &mut String, a: &ArrayType) {
+        let _ = write!(out, "{{\"elementType\":{},\"length\":{},\"stride\":{},\"argumentIndexStride\":{}", a.element_type().as_raw(),
+                       a.array_length(), a.stride(), a.argument_index_stride());
+        if let Some(t) = a.element_struct_type() {
+            out.push_str(",\"struct\":");
+            structure(out, t);
+        }
+        if let Some(t) = a.element_array_type() {
+            out.push_str(",\"array\":");
+            array(out, t);
+        }
+        if let Some(t) = a.element_pointer_type() {
+            out.push_str(",\"pointer\":");
+            pointer(out, t);
+        }
+        if let Some(t) = a.element_texture_reference_type() {
+            out.push_str(",\"texture\":");
+            texture_reference(out, t);
+        }
+        out.push('}');
+    }
+
+    fn pointer(out: &mut String, p: &PointerType) {
+        let _ = write!(out, "{{\"elementType\":{},\"access\":{},\"alignment\":{},\"size\":{},\"argumentBuffer\":{}", p.element_type().as_raw(),
+                       p.access().as_raw(), p.alignment(), p.data_size(), p.element_is_argument_buffer());
+        if let Some(t) = p.element_struct_type() {
+            out.push_str(",\"struct\":");
+            structure(out, t);
+        }
+        if let Some(t) = p.element_array_type() {
+            out.push_str(",\"array\":");
+            array(out, t);
+        }
+        out.push('}');
+    }
+
+    fn texture_reference(out: &mut String, t: &TextureReferenceType) {
+        let _ = write!(out, "{{\"dataType\":{},\"textureType\":{},\"access\":{},\"depth\":{}}}", t.texture_data_type().as_raw(),
+                       t.texture_type().as_raw(), t.access().as_raw(), t.is_depth_texture());
+    }
+
+    fn binding(out: &mut String, b: &Binding) {
+        out.push_str("{\"name\":");
+        string(out, b.name());
+        let _ = write!(out, ",\"type\":{},\"access\":{},\"index\":{},\"used\":{},\"argument\":{}", b.binding_type().as_raw(), b.access().as_raw(),
+                       b.index(), b.is_used(), b.is_argument());
+        if let Some(buffer) = b.buffer() {
+            let _ = write!(out, ",\"buffer\":{{\"alignment\":{},\"size\":{},\"dataType\":{}", buffer.buffer_alignment(), buffer.buffer_data_size(),
+                           buffer.buffer_data_type().as_raw());
+            if let Some(t) = buffer.buffer_struct_type() {
+                out.push_str(",\"struct\":");
+                structure(out, t);
+            }
+            if let Some(t) = buffer.buffer_pointer_type() {
+                out.push_str(",\"pointer\":");
+                pointer(out, t);
+            }
+            out.push('}');
+        }
+        if let Some(t) = b.threadgroup() {
+            let _ = write!(out, ",\"threadgroup\":{{\"alignment\":{},\"size\":{}}}", t.threadgroup_memory_alignment(), t.threadgroup_memory_data_size());
+        }
+        if let Some(t) = b.texture() {
+            let _ = write!(out, ",\"texture\":{{\"textureType\":{},\"dataType\":{},\"depth\":{},\"arrayLength\":{}}}", t.texture_type().as_raw(),
+                           t.texture_data_type().as_raw(), t.is_depth_texture(), t.array_length());
+        }
+        out.push('}');
+    }
+
+    /// `"name":[binding,...]`.
+    pub(super) fn stage(out: &mut String, name: &str, bindings: &[Binding]) {
+        let _ = write!(out, "\"{name}\":[");
+        for (i, b) in bindings.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            binding(out, b);
+        }
+        out.push(']');
+    }
+}
+
+fn reflection_handle(json: String) -> Result<*mut NmbReflection, String> {
+    Ok(boxed(NmbReflection(std::ffi::CString::new(json).map_err(|_| "a NUL in the reflection".to_string())?)))
+}
+
+/// The reflection of the render pipeline `descriptor` describes: `{"vertex":[...],"fragment":[...]}`.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_pipeline_reflection(descriptor: *const NmbRenderPipelineDescriptor) -> *mut NmbReflection {
+    guard(std::ptr::null_mut(), || {
+        let budget = metal2vulkan::Budget::with_deadline(None);
+        let reflection = render_descriptor(descriptor)?.reflection(&budget).map_err(e("render pipeline reflection"))?;
+        let mut json = String::from("{");
+        reflection_json::stage(&mut json, "vertex", reflection.vertex_bindings());
+        json.push(',');
+        reflection_json::stage(&mut json, "fragment", reflection.fragment_bindings());
+        json.push('}');
+        reflection_handle(json)
+    })
+}
+
+/// The reflection of the compute pipeline `descriptor` describes: `{"bindings":[...]}`.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_compute_pipeline_reflection(descriptor: *const NmbComputePipelineDescriptor) -> *mut NmbReflection {
+    guard(std::ptr::null_mut(), || {
+        let budget = metal2vulkan::Budget::with_deadline(None);
+        let reflection = compute_descriptor(descriptor)?.reflection(&budget).map_err(e("compute pipeline reflection"))?;
+        let mut json = String::from("{");
+        reflection_json::stage(&mut json, "bindings", reflection.bindings());
+        json.push('}');
+        reflection_handle(json)
+    })
+}
+
+/// The reflection's JSON, valid until its release.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_reflection_json(reflection: *const NmbReflection) -> *const c_char {
+    guard(std::ptr::null(), || Ok(get(reflection)?.0.as_ptr()))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_reflection_release(reflection: *mut NmbReflection) {
+    release(reflection)
 }
 
 // ---- binary archives ----
@@ -1889,58 +2255,77 @@ fn texture_of(a: &NmbPassAttachment) -> Result<Option<Texture>, String> {
     if a.texture.is_null() { Ok(None) } else { Ok(Some(get(a.texture)?.0.clone())) }
 }
 
+#[repr(C)]
+pub struct NmbRenderPass(RenderPassDescriptor);
+
+fn render_pass_snapshot(d: &NmbRenderPassDescriptor) -> Result<RenderPassDescriptor, String> {
+    let mut pass = RenderPassDescriptor::new();
+    for (slot, a) in pass.color_attachments.iter_mut().zip(d.colors.iter()) {
+        slot.texture = texture_of(a)?;
+        slot.resolve_texture = optional(a.resolve_texture)?.map(|t| t.0.clone());
+        slot.resolve_level = a.resolve_level;
+        slot.resolve_slice = a.resolve_slice;
+        slot.resolve_depth_plane = a.resolve_depth_plane;
+        slot.level = a.level;
+        slot.slice = a.slice;
+        slot.depth_plane = a.depth_plane;
+        slot.load_action = LoadAction::from_raw(a.load).map_err(e("load action"))?;
+        slot.store_action = StoreAction::from_raw(a.store).map_err(e("store action"))?;
+        slot.clear_color = ClearColor::new(a.clear[0], a.clear[1], a.clear[2], a.clear[3]);
+    }
+    let depth = &mut pass.depth_attachment;
+    depth.texture = texture_of(&d.depth)?;
+    depth.resolve_texture = optional(d.depth.resolve_texture)?.map(|t| t.0.clone());
+    depth.resolve_level = d.depth.resolve_level;
+    depth.resolve_slice = d.depth.resolve_slice;
+    depth.resolve_depth_plane = d.depth.resolve_depth_plane;
+    depth.depth_resolve_filter = MultisampleDepthResolveFilter::from_raw(d.depth.resolve_filter).map_err(e("depth resolve filter"))?;
+    depth.level = d.depth.level;
+    depth.slice = d.depth.slice;
+    depth.depth_plane = d.depth.depth_plane;
+    depth.load_action = LoadAction::from_raw(d.depth.load).map_err(e("load action"))?;
+    depth.store_action = StoreAction::from_raw(d.depth.store).map_err(e("store action"))?;
+    depth.clear_depth = d.depth.clear[0];
+    let stencil = &mut pass.stencil_attachment;
+    stencil.texture = texture_of(&d.stencil)?;
+    stencil.resolve_texture = optional(d.stencil.resolve_texture)?.map(|t| t.0.clone());
+    stencil.resolve_level = d.stencil.resolve_level;
+    stencil.resolve_slice = d.stencil.resolve_slice;
+    stencil.resolve_depth_plane = d.stencil.resolve_depth_plane;
+    stencil.stencil_resolve_filter = MultisampleStencilResolveFilter::from_raw(d.stencil.resolve_filter).map_err(e("stencil resolve filter"))?;
+    stencil.level = d.stencil.level;
+    stencil.slice = d.stencil.slice;
+    stencil.depth_plane = d.stencil.depth_plane;
+    stencil.load_action = LoadAction::from_raw(d.stencil.load).map_err(e("load action"))?;
+    stencil.store_action = StoreAction::from_raw(d.stencil.store).map_err(e("store action"))?;
+    stencil.clear_stencil = d.stencil.clear[0] as u32;
+    pass.render_target_width = d.width;
+    pass.render_target_height = d.height;
+    pass.render_target_array_length = d.array_length;
+    pass.default_raster_sample_count = d.samples;
+    if !d.visibility.is_null() {
+        pass.visibility_result_buffer = Some(get(d.visibility)?.0.clone());
+    }
+    Ok(pass)
+}
+
 #[unsafe(no_mangle)]
-pub extern "C" fn nmb_render_encoder_new(command_buffer: *mut NmbCommandBuffer, descriptor: *const NmbRenderPassDescriptor)
-                                         -> *mut NmbEncoder {
+pub extern "C" fn nmb_render_pass_new(descriptor: *const NmbRenderPassDescriptor) -> *mut NmbRenderPass {
+    guard(std::ptr::null_mut(), || Ok(boxed(NmbRenderPass(render_pass_snapshot(get(descriptor)?)?))))
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_pass_release(pass: *mut NmbRenderPass) { release(pass) }
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_encoder_new_from_pass(command_buffer: *mut NmbCommandBuffer, pass: *const NmbRenderPass) -> *mut NmbEncoder {
     guard(std::ptr::null_mut(), || {
-        let d = get(descriptor)?;
-        let mut pass = RenderPassDescriptor::new();
-        for (slot, a) in pass.color_attachments.iter_mut().zip(d.colors.iter()) {
-            slot.texture = texture_of(a)?;
-            slot.resolve_texture = optional(a.resolve_texture)?.map(|t| t.0.clone());
-            slot.resolve_level = a.resolve_level;
-            slot.resolve_slice = a.resolve_slice;
-            slot.resolve_depth_plane = a.resolve_depth_plane;
-            slot.level = a.level;
-            slot.slice = a.slice;
-            slot.depth_plane = a.depth_plane;
-            slot.load_action = LoadAction::from_raw(a.load).map_err(e("load action"))?;
-            slot.store_action = StoreAction::from_raw(a.store).map_err(e("store action"))?;
-            slot.clear_color = ClearColor::new(a.clear[0], a.clear[1], a.clear[2], a.clear[3]);
-        }
-        let depth = &mut pass.depth_attachment;
-        depth.texture = texture_of(&d.depth)?;
-        depth.resolve_texture = optional(d.depth.resolve_texture)?.map(|t| t.0.clone());
-        depth.resolve_level = d.depth.resolve_level;
-        depth.resolve_slice = d.depth.resolve_slice;
-        depth.resolve_depth_plane = d.depth.resolve_depth_plane;
-        depth.depth_resolve_filter = MultisampleDepthResolveFilter::from_raw(d.depth.resolve_filter).map_err(e("depth resolve filter"))?;
-        depth.level = d.depth.level;
-        depth.slice = d.depth.slice;
-        depth.depth_plane = d.depth.depth_plane;
-        depth.load_action = LoadAction::from_raw(d.depth.load).map_err(e("load action"))?;
-        depth.store_action = StoreAction::from_raw(d.depth.store).map_err(e("store action"))?;
-        depth.clear_depth = d.depth.clear[0];
-        let stencil = &mut pass.stencil_attachment;
-        stencil.texture = texture_of(&d.stencil)?;
-        stencil.resolve_texture = optional(d.stencil.resolve_texture)?.map(|t| t.0.clone());
-        stencil.resolve_level = d.stencil.resolve_level;
-        stencil.resolve_slice = d.stencil.resolve_slice;
-        stencil.resolve_depth_plane = d.stencil.resolve_depth_plane;
-        stencil.stencil_resolve_filter = MultisampleStencilResolveFilter::from_raw(d.stencil.resolve_filter).map_err(e("stencil resolve filter"))?;
-        stencil.level = d.stencil.level;
-        stencil.slice = d.stencil.slice;
-        stencil.depth_plane = d.stencil.depth_plane;
-        stencil.load_action = LoadAction::from_raw(d.stencil.load).map_err(e("load action"))?;
-        stencil.store_action = StoreAction::from_raw(d.stencil.store).map_err(e("store action"))?;
-        stencil.clear_stencil = d.stencil.clear[0] as u32;
-        pass.render_target_width = d.width;
-        pass.render_target_height = d.height;
-        pass.render_target_array_length = d.array_length;
-        pass.default_raster_sample_count = d.samples;
-        if !d.visibility.is_null() {
-            pass.visibility_result_buffer = Some(get(d.visibility)?.0.clone());
-        }
+        let encoder = get(command_buffer)?.0.render_command_encoder(&get(pass)?.0).map_err(e("render encoder"))?;
+        Ok(boxed(NmbEncoder::Render(encoder)))
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_encoder_new(command_buffer: *mut NmbCommandBuffer, descriptor: *const NmbRenderPassDescriptor) -> *mut NmbEncoder {
+    guard(std::ptr::null_mut(), || {
+        let pass = render_pass_snapshot(get(descriptor)?)?;
         let encoder = get(command_buffer)?.0.render_command_encoder(&pass).map_err(e("render encoder"))?;
         Ok(boxed(NmbEncoder::Render(encoder)))
     })
@@ -2389,6 +2774,21 @@ pub extern "C" fn nmb_render_set_viewports(encoder: *mut NmbEncoder, values: *co
     })
 }
 #[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_set_vertex_amplification(encoder: *mut NmbEncoder, count: u64, mappings: *const u32) -> bool {
+    guard(false, || {
+        // The runtime validates the actual device/pipeline maximum at draw time.
+        // Bound foreign pointer reads to its supported Metal view count.
+        if count == 0 || count > 8 { return Err("invalid vertex amplification count".into()); }
+        let views = if mappings.is_null() { None } else {
+            let pairs = unsafe { std::slice::from_raw_parts(mappings, count as usize * 2) };
+            Some(pairs.chunks_exact(2).map(|v| VertexAmplificationViewMapping::new(v[0],v[1])).collect::<Vec<_>>())
+        };
+        render(encoder)?.set_vertex_amplification_count(count, views.as_deref())
+            .map_err(e("vertex amplification"))?;
+        Ok(true)
+    })
+}
+#[unsafe(no_mangle)]
 pub extern "C" fn nmb_render_set_scissors(encoder: *mut NmbEncoder, values: *const u64, count: usize) -> bool {
     guard(false, || {
         if count == 0 || count > 16 || values.is_null() { return Err("invalid scissor array".into()); }
@@ -2441,4 +2841,261 @@ pub extern "C" fn nmb_command_buffer_diagnostic_id(buffer: *const NmbCommandBuff
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_gpu_diagnostic_hook(hook: extern "C" fn(u32,u64,u64,u64)) {
     metal2vulkan_runtime::stage_trace::set_diagnostic_hook(hook);
+}
+
+
+// Argument-buffer layouts and writes use the translator's AIR-reflected
+// implementation; do not return a placeholder encoder for native VFX.
+pub struct NmbArgumentEncoder(metal2vulkan_runtime::ArgumentEncoder);
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_function_argument_encoder(f: *const NmbFunction, index: u32) -> *mut NmbArgumentEncoder {
+    guard(std::ptr::null_mut(), || get(f)?.0.new_argument_encoder_with_buffer_index(index)
+        .map(|v| boxed(NmbArgumentEncoder(v))).map_err(|e| e.to_string()))
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_argument_encoder_release(e: *mut NmbArgumentEncoder) {release(e)}
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_argument_encoder_size(e: *const NmbArgumentEncoder, alignment: bool) -> u64 {
+    guard(0, || {let e=&get(e)?.0;Ok(if alignment {e.alignment()} else {e.encoded_length()})})
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_argument_encoder_target(e: *mut NmbArgumentEncoder, b: *const NmbBuffer, offset: u64, element: u64) -> bool {
+    guard(false, || {let b=if b.is_null(){None}else{Some(&get(b)?.0)};
+        get_mut(e)?.0.set_argument_buffer_start_offset_array_element(b,offset,element).map_err(|e|e.to_string())?;Ok(true)})
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_argument_encoder_buffer(e: *const NmbArgumentEncoder, b: *const NmbBuffer, offset: u64, index: u32) -> bool {
+    guard(false, || {get(e)?.0.set_buffer(if b.is_null(){None}else{Some(&get(b)?.0)},offset,index).map_err(|e|e.to_string())?;Ok(true)})
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_argument_encoder_texture(e: *const NmbArgumentEncoder, t: *const NmbTexture, index: u32) -> bool {
+    guard(false, || {get(e)?.0.set_texture(if t.is_null(){None}else{Some(&get(t)?.0)},index).map_err(|e|e.to_string())?;Ok(true)})
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_argument_encoder_sampler(e: *const NmbArgumentEncoder, s: *const NmbSampler, index: u32) -> bool {
+    guard(false, || {get(e)?.0.set_sampler_state(if s.is_null(){None}else{Some(&get(s)?.0)},index).map_err(|e|e.to_string())?;Ok(true)})
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_argument_encoder_constant(e: *const NmbArgumentEncoder, index: u32) -> *mut c_void {
+    guard(std::ptr::null_mut(), || get(e)?.0.constant_data(index).map(|p|p.as_ptr().cast()).map_err(|e|e.to_string()))
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_argument_encoder_nested(e: *const NmbArgumentEncoder, index: u32) -> *mut NmbArgumentEncoder {
+    guard(std::ptr::null_mut(), || get(e)?.0.new_argument_encoder_for_buffer_at_index(index)
+        .map(|e|boxed(NmbArgumentEncoder(e))).map_err(|e|e.to_string()))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_function_patch_type(function: *const NmbFunction) -> u64 {
+    guard(0, || Ok(get(function)?.0.patch_type().map_err(e("patch type"))?.as_raw() as u64))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_function_patch_control_point_count(function: *const NmbFunction) -> i64 {
+    guard(-1, || Ok(get(function)?.0.patch_control_point_count().map_err(e("patch control point count"))?.map_or(-1, i64::from)))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_compute_dispatch_indirect(encoder: *mut NmbEncoder, buffer: *mut NmbBuffer, offset: u64, per_group: *const u64) -> bool {
+    guard(false, || {
+        let g = triple(per_group)?;
+        compute(encoder)?.dispatch_threadgroups_indirect(&get(buffer)?.0, offset, Size::new(g[0], g[1], g[2]))
+            .map_err(e("indirect dispatch"))?;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_set_tessellation_factor_buffer(encoder: *mut NmbEncoder, buffer: *mut NmbBuffer, offset: u64, instance_stride: u64)
+                                                            -> bool {
+    guard(false, || {
+        let buffer = if buffer.is_null() { None } else { Some(&get(buffer)?.0) };
+        render(encoder)?.set_tessellation_factor_buffer(buffer, offset, instance_stride).map_err(e("tessellation factor buffer"))?;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_set_tessellation_factor_scale(encoder: *mut NmbEncoder, scale: f32) -> bool {
+    guard(false, || {
+        render(encoder)?.set_tessellation_factor_scale(scale);
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn nmb_render_draw_patches(encoder: *mut NmbEncoder, control_points: u32, patch_start: u32, patch_count: u32,
+                                          patch_index: *mut NmbBuffer, patch_index_offset: u64, control_point_index: *mut NmbBuffer,
+                                          control_point_index_offset: u64, instances: u32, base_instance: u32, indirect: *mut NmbBuffer,
+                                          indirect_offset: u64) -> bool {
+    guard(false, || {
+        let r = render(encoder)?;
+        let patch_index = optional_buffer(patch_index)?;
+        let result = match (optional_buffer(control_point_index)?, optional_buffer(indirect)?) {
+            (None, None) => r.draw_patches(control_points, patch_start, patch_count, patch_index, patch_index_offset, instances, base_instance),
+            (None, Some(indirect)) => r.draw_patches_indirect(control_points, patch_index, patch_index_offset, indirect, indirect_offset),
+            (Some(points), None) => r.draw_indexed_patches(control_points, patch_start, patch_count, patch_index, patch_index_offset, points,
+                                                           control_point_index_offset, instances, base_instance),
+            (Some(points), Some(indirect)) => r.draw_indexed_patches_indirect(control_points, patch_index, patch_index_offset, points,
+                                                                              control_point_index_offset, indirect, indirect_offset),
+        };
+        result.map_err(e("patch draw"))?;
+        Ok(true)
+    })
+}
+
+fn optional_buffer<'a>(buffer: *mut NmbBuffer) -> Result<Option<&'a Buffer>, String> {
+    if buffer.is_null() { Ok(None) } else { Ok(Some(&get(buffer)?.0)) }
+}
+
+#[repr(C)]
+pub struct NmbTessellation {
+    pub tessellates: u64,
+    pub max_factor: u64,
+    pub partition_mode: u64,
+    pub factor_format: u64,
+    pub factor_step_function: u64,
+    pub output_winding: u64,
+    pub control_point_index_type: u64,
+    pub factor_scale_enabled: u64,
+}
+
+fn metal_command_buffer_error_code(error: Option<CommandBufferError>) -> u64 {
+    error.filter(|error| error.origin() == FailureOrigin::Metal).map_or(0, |error| error.metal_code())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_command_buffer_metal_error_code(command_buffer: *const NmbCommandBuffer) -> u64 {
+    guard(0, || Ok(metal_command_buffer_error_code(get(command_buffer)?.0.error())))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_allocation_sites(out: *mut u64, max: usize) -> usize {
+    if out.is_null() {
+        return 0;
+    }
+    let sites = metal2vulkan_runtime::allocation_sites();
+    let count = sites.len().min(max);
+    // SAFETY: the caller's `max` records of twelve words.
+    let out = unsafe { std::slice::from_raw_parts_mut(out, count * 12) };
+    for (record, site) in out.chunks_mut(12).zip(&sites) {
+        record[0] = site.bytes;
+        record[1] = site.count;
+        for (word, frame) in record[2..].iter_mut().zip(site.frames) {
+            *word = frame as u64;
+        }
+    }
+    count
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_memory_counts(device: *const NmbDevice, out: *mut u64) -> bool {
+    guard(false, || {
+        if out.is_null() {
+            return Err("null counts".into());
+        }
+        // SAFETY: the header's ten words.
+        let out = unsafe { std::slice::from_raw_parts_mut(out, 10) };
+        let w = get(device)?.0.work_counts();
+        out.copy_from_slice(&[w.pooled_memory_bytes_live, w.pooled_memory_bytes_used, w.empty_memory_bytes_live,
+                              w.dedicated_memory_bytes_live, w.imported_memory_bytes_live, w.device_memory_allocated,
+                              w.memory_blocks_live, w.dedicated_memory_blocks_live, w.gpu_pool_blocks_made, w.gpu_pool_blocks_released]);
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_pass_counts(device: *const NmbDevice, out: *mut u64) -> bool {
+    guard(false, || {
+        if out.is_null() {
+            return Err("null counts".into());
+        }
+        // SAFETY: the header's ten words.
+        let out = unsafe { std::slice::from_raw_parts_mut(out, 10) };
+        let w = get(device)?.0.work_counts();
+        out.copy_from_slice(&[w.render_passes_begun_instances, w.inline_passes_split, w.instance_splits_barrier,
+                              w.instance_splits_tile_memory, w.instance_splits_memoryless_write, w.instance_splits_pending_pipeline,
+                              w.stand_ins_made, w.stand_in_bytes, w.stand_in_copies_made, w.stand_in_copies_made_at_draws]);
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_shader_cache_detail(device: *const NmbDevice, out: *mut u64) -> bool {
+    guard(false, || {
+        if out.is_null() {
+            return Err("null stats".into());
+        }
+        // SAFETY: the header's 24 words.
+        let out = unsafe { std::slice::from_raw_parts_mut(out, 24) };
+        let c = get(device)?.0.shader_cache_statistics();
+        let words = [
+            c.hits,
+            c.misses,
+            c.function_hits,
+            c.function_misses,
+            c.compute_pipeline_hits,
+            c.compute_pipeline_misses,
+            c.render_pipeline_hits,
+            c.render_pipeline_misses,
+            c.rejected,
+            c.read_failures,
+            c.writes,
+            c.writes_queued,
+            c.writes_on_thread,
+            c.written_bytes,
+            c.queued_hits,
+            c.write_failures,
+            c.evictions,
+            c.driver_loads,
+            c.driver_pipeline_hits,
+            c.driver_pipeline_misses,
+            c.driver_saves,
+        ];
+        out.fill(0);
+        out[..words.len()].copy_from_slice(&words);
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_texture_counts(device: *const NmbDevice, out: *mut u64) -> bool {
+    guard(false, || {
+        if out.is_null() {
+            return Err("null counts".into());
+        }
+        // SAFETY: the header's eight words.
+        let out = unsafe { std::slice::from_raw_parts_mut(out, 8) };
+        let w = get(device)?.0.work_counts();
+        out.copy_from_slice(&[w.host_textures_in_place, w.pitched_host_images, w.host_texture_shadows_refused_pitch,
+                              w.host_texture_shadows_refused_image, w.shadowed_textures, w.shadow_copies, w.shadow_texels_copied_back,
+                              w.host_texture_shadows_render_target]);
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nmb_function_new_specialized_zero_rest(library: *mut NmbLibrary, name: *const c_char,
+                                                                constants: *const NmbConstant, count: u32) -> *mut NmbFunction {
+    // SAFETY: the caller's contract.
+    unsafe { specialized(library, name, constants, count, true) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_runtime_build() -> *const c_char {
+    concat!(env!("NMB_RUNTIME_ID"), "\0").as_ptr().cast()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_stage_ring_read(from: u64, out: *mut metal2vulkan_runtime::stage_trace::StageRecord, max: usize,
+                                      next: *mut u64) -> usize {
+    if out.is_null() || next.is_null() {
+        return 0;
+    }
+    // SAFETY: the caller's `max` records and its word.
+    let records = unsafe { std::slice::from_raw_parts_mut(out, max) };
+    let (count, following) = metal2vulkan_runtime::stage_trace::read(from, records);
+    unsafe { *next = following };
+    count
 }

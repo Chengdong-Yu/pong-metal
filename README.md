@@ -1,22 +1,11 @@
-# PongMetal
+# Pong Metal
 
-Pong 的 Adreno 730 Metal 前端：面向 22H374 的 `PongAdrenoMetal.bundle`、GOP wire、扫描输出呈现与 pipeline cache 导出。
-
-## 适配硬件
-
-- SM8475 的 Adreno 730；要求真实 CP 与 fence 就绪后才把设备交给用户态
-- 显示由 GOP wire 扫描输出呈现，格式转换走 `scanout_convert.ll`
-
-## 仓库关系
-
-设备分支：前端派生自上游 [UniXNU/AdrenoMetal](https://github.com/UniXNU/AdrenoMetal)（原 NativeMetal），原生用户客户端派生自 [UniXNU/Adreno740](https://github.com/UniXNU/Adreno740)；固件、供电、SMMU 与扫描输出仍留在 Pong 自己的实现里。
-
-## 说明
-
-- 22H374 上 `_MTLDevice` 是 600 字节（20G81 是 528），插件构建器要求 bridge 记录的实际长度一致才链接。
-- `bridge/` 是 Rust 侧（`NativeMetalObjects.rs`）。
-
-构建、接口与组件目录见 [UniXNU 组件目录](https://unixnu.com/reference/components)，板级输入与编译入口在 [UniXNU-pong](https://github.com/Chengdong-Yu/UniXNU-pong)。
+Pong's A730 frontend is a device fork of upstream
+[AdrenoMetal](https://github.com/UniXNU/AdrenoMetal), previously named
+NativeMetal. Its native user-client implementation derives from
+[Adreno740](https://github.com/UniXNU/Adreno740); Pong retains SM8475/A730
+firmware, power, SMMU and scanout integration. Runtime classes, symbols and
+the fixed-size wire ABI remain compatible with the selected native backend.
 
 ## Current 22H374 integration
 
@@ -59,7 +48,7 @@ python3 scripts/build-pong-metal-plugin.py --guest-build 22H374 \
 
 These commands compile artifacts without modifying a phone. Source pins,
 reviewed deltas and upstream migration notes are recorded in
-[the 2026-10-24 sync](https://github.com/Chengdong-Yu/UniXNU-pong/blob/main/migration/ipados18/upstream-20261024.md).
+[the 2026-10-24 sync](../../migration/ipados18/upstream-20261024.md).
 
 ## 20G81 development reference
 
@@ -156,7 +145,3 @@ source trees: NativeMetal MIT, metal2vulkan GPL/LGPL, and Mesa per-file
 licenses. Product archives, frontend objects and exact build commands stay
 beside the local libraries; no phone installation or runtime test is run by
 these scripts.
-
-## 许可
-
-`LICENSE` 为 MIT（Copyright (c) 2026 NativeMetal contributors）；`NativeGOPWire.h` 与 `NativeHalfCodes.h` 为 BSD-2-Clause-Patent，逐文件 SPDX 为准。

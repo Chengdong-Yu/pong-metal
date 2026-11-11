@@ -71,8 +71,12 @@ static bool backend(unsigned port,uint64_t *registryID)
 {
     char version[64]={};size_t length=sizeof(version);
     if(sysctlbyname("kern.osversion",version,&length,NULL,0) || strcmp(version,
-#if PONG_GUEST_22H374
+#if PONG_GUEST_DARWIN24 || PONG_GUEST_22H374
+#if PONG_GUEST_22G100
+        "22G100"
+#else
         "22H374"
+#endif
 #else
         "20G81"
 #endif
@@ -95,8 +99,12 @@ static bool backend(unsigned port,uint64_t *registryID)
      */
     if(!propertyTrue(read,port,CFSTR("PongAdrenoCPReady")) ||
        !propertyTrue(read,port,CFSTR(
-#if PONG_GUEST_22H374
+#if PONG_GUEST_DARWIN24 || PONG_GUEST_22H374
+#if PONG_GUEST_22G100
+       "PongMetal22G100Enabled"
+#else
        "PongMetal22H374Enabled"
+#endif
 #else
        "PongMetal20G81Enabled"
 #endif
@@ -150,23 +158,41 @@ static id openDevice(unsigned port)
     if(base)[candidates addObject:[[base stringByAppendingPathComponent:@"PongMetal"] stringByAppendingPathComponent:process]];
     // main 461a842: let Turnip choose GMEM/sysmem for each attachment/pass.
     // Pong's BR/BV scheduling still requires concurrent binning disabled.
-    // Official 8-bit BGRA policy: GPU system-memory rendering. This still
-    // runs on Adreno/Metal; it avoids the GMEM load/store channel permutation.
+    // Use real A730 tile memory where Turnip's attachment/geometry rules
+    // permit it. The matching memory-side swap and bounded tile stores are
+    // required for imported BGRA surfaces. Keep BV/BR concurrent binning off.
+    // WebKit composites imported/padded tiles and resolves. Use the official
+    // SYSMEM baseline there; the matching Turnip transient-attachment rule
+    // still chooses real GMEM where a lazy attachment fits. This changes
+    // GPU render mode, not Metal discovery or CPU rendering fallback.
+    const char *name=getprogname();
+    const bool browser=name&&(!strcmp(name,"MobileSafari")||!strncmp(name,"com.apple.WebKit.",17));
+    const char *renderFlags=browser?"sysmem,nocb":"gmem,nocb";
+    if(browser) {
+      // Restore the browser's qualified immediate encoding path. Preserve
+      // requested sample counts and native resolve instead of rewriting
+      // WebKit's multisample tile textures as ordinary single-sample images.
+      // Other UI clients retain reusable asynchronous encoding/GMEM policy.
+      setenv("PONG_METAL_ENCODE_SYNC","1",1);
+      setenv("NATIVE_METAL_SINGLE_SAMPLE","0",1);
+    }
     {char args[1024]={};size_t size=sizeof args;
      if(!sysctlbyname("kern.bootargs",args,&size,nullptr,0)) {
       if(strstr(args,"pong_gpu_trace=1")){setenv("SHENG_GPU_TRACE","1",1);setenv("SHENG_DIAG","1",1);}
       if(strstr(args,"pong_gpu_pixels=1"))setenv("SHENG_GPU_PIXELS","1",1);
+      if(strstr(args,"pong_gpu_gmem=0"))renderFlags="sysmem,nocb";
+      if(strstr(args,"pong_gpu_gmem=1"))renderFlags="gmem,nocb";
      }}
-    setenv("TU_DEBUG","sysmem,nocb",1);
+    setenv("TU_DEBUG",renderFlags,1);
     // Pong implements NativeAdreno directly, not Sheng's AGX selector tunnel.
     setenv("TU_DARWIN_SERVICE","NativeAdrenoGpuPublished",1);
     setenv("TU_DARWIN_OPEN_TYPE","0x4147",1);
-    // The ABI1 clients have bounded GPU VA and all BOs are wired on Pong.
-    // Keep a small reuse cache, not ten seconds of unbounded image spares.
-    // This budget applies only after the runtime retires the last live owner.
-    setenv("METAL2VULKAN_SPARE_IMAGE_MIB",!strcmp(getprogname(),"backboardd")?"128":"32",0);
-    setenv("TU_DARWIN_BO_CACHE_MIB",!strcmp(getprogname(),"backboardd")?"96":
-        !strcmp(getprogname(),"SpringBoard")?"64":"8",0);
+    // Independent process VMs no longer share small fixed VA leases. Follow
+    // upstream's age/pressure-driven spare image reuse; live DMA ownership
+    // is unchanged and allocation failures reclaim genuinely idle backing.
+    // Follow upstream's reuse age, pressure notification and allocation-fail
+    // reclaim. Former8/64/96MiB name quotas forced large retired BOs to be
+    // unwired and prepared again despite each client now owning its VM.
     // Live Metal queues publish their current aggregate priority. Keep an
     // explicit user override, but never force a process-wide permanent boost.
     setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION","1",1);
@@ -230,7 +256,7 @@ static bool selectedClient()
         while(fgets(line,sizeof(line),file)) {
             line[strcspn(line,"\r\n")]=0;
             if(!strcmp(line,process)
-#if PONG_GUEST_22H374
+#if PONG_GUEST_DARWIN24 || PONG_GUEST_22H374
                 || !strcmp(line,"*")
 #endif
             ){selected=true;break;}
@@ -250,22 +276,8 @@ static void startPresentation(id candidate,unsigned port)
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE,0),^{
         pongscanout::start(iokit,port,(id<MTLDevice>)candidate);release(port);
     });
-    // Bounded observations of real application work, not synthetic renders.
-    // RAM cache journals disappear on REC; retain these few status lines.
-    for(unsigned seconds:{5u,20u,60u})
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,int64_t(seconds)*NSEC_PER_SEC),
-            dispatch_get_global_queue(QOS_CLASS_UTILITY,0),^{
-                char status[240]={};native_bridge_metal_status(status,sizeof(status));
-                report(status,0);
-                if(seconds>=20) {
-                    char rows[4096]={};native_bridge_metal_telemetry(rows,sizeof rows);
-                    char *line=rows;
-                    while(*line) {
-                        char *end=strchr(line,'\n');if(end)*end=0;
-                        report(line,0);if(!end)break;line=end+1;
-                    }
-                }
-            });
+    // Completion and timing evidence now lives in the bounded frame file.
+    // Do not emit repeated whole telemetry tables into the boot console.
 }
 }
 @implementation PongAdrenoMetalDevice

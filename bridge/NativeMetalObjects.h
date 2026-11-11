@@ -28,6 +28,14 @@ typedef struct NmbEvent NmbEvent;
 typedef struct NmbFence NmbFence;
 
 const char *nmb_last_error(void);
+const void *nmb_scanout_convert_air(size_t *length);
+size_t nmb_stage_ring_read(uint64_t from, void *out, size_t max, uint64_t *next);
+const char *nmb_runtime_build(void);
+bool nmb_device_texture_counts(const NmbDevice *, uint64_t out[8]);
+bool nmb_device_shader_cache_detail(const NmbDevice *, uint64_t out[24]);
+bool nmb_device_pass_counts(const NmbDevice *, uint64_t out[10]);
+bool nmb_device_memory_counts(const NmbDevice *, uint64_t out[10]);
+size_t nmb_allocation_sites(uint64_t *out, size_t max);
 /* loader: a library exporting vkGetInstanceProcAddr (Turnip on the tablet). cache: a writable directory for translated shaders. */
 NmbDevice *nmb_device_open(const char *loader, const char *cache);
 void nmb_device_release(NmbDevice *);
@@ -73,6 +81,7 @@ uint64_t nmb_buffer_gpu_address(const NmbBuffer *);
 
 struct NmbTextureDescriptor {
     uint64_t type, format, width, height, depth, levels, samples, array_length, usage, options, swizzle;
+    uint64_t rotation,framebuffer_only,is_drawable;
 };
 /* Heaps: type 0 automatic / 1 placement; offset UINT64_MAX asks an automatic heap to place the resource. */
 NmbHeap *nmb_heap_new(NmbDevice *, uint64_t type, uint64_t size, uint64_t options);
@@ -122,7 +131,10 @@ NmbFunction *nmb_function_new(NmbLibrary *, const char *name);
  * indexed value; bytes holds the value's bytes. */
 struct NmbConstant {uint64_t type, index; const char *name; const void *bytes; uint64_t length;};
 NmbFunction *nmb_function_new_specialized(NmbLibrary *, const char *name, const struct NmbConstant *constants, uint32_t count);
+NmbFunction *nmb_function_new_specialized_zero_rest(NmbLibrary *, const char *, const struct NmbConstant *, uint32_t);
 NmbFunction *nmb_function_new_zeroed(NmbLibrary *, const char *name);
+NmbFunction *nmb_function_new_zero_constants(NmbLibrary *, const char *name);
+bool nmb_no_copy_remaps(uint64_t out[2]);
 bool nmb_device_heap_texture_size_and_align(NmbDevice *, const struct NmbTextureDescriptor *, uint64_t out[2]);
 bool nmb_device_heap_buffer_size_and_align(NmbDevice *, uint64_t length, uint64_t options, uint64_t out[2]);
 void nmb_function_release(NmbFunction *);
@@ -139,6 +151,7 @@ struct NmbColorAttachment {
 };
 struct NmbVertexAttribute {uint64_t format, offset, buffer;};
 struct NmbVertexLayout {uint64_t stride, step_function, step_rate;};
+struct NmbTessellation {uint64_t tessellates,max_factor,partition_mode,factor_format,factor_step_function,output_winding,control_point_index_type,factor_scale_enabled;};
 struct NmbRenderPipelineDescriptor {
     NmbFunction *vertex, *fragment;
     struct NmbColorAttachment colors[8];
@@ -146,6 +159,12 @@ struct NmbRenderPipelineDescriptor {
     uint64_t vertex_inputs; /* 0: no vertex descriptor */
     struct NmbVertexAttribute attributes[31];
     struct NmbVertexLayout layouts[31];
+    NmbFunction *const *vertex_linked;uint64_t vertex_linked_count;
+    NmbFunction *const *vertex_private_linked;uint64_t vertex_private_linked_count;
+    NmbFunction *const *fragment_linked;uint64_t fragment_linked_count;
+    NmbFunction *const *fragment_private_linked;uint64_t fragment_private_linked_count;
+    uint64_t max_vertex_amplification_count;
+    struct NmbTessellation tessellation;
 };
 NmbRenderPipeline *nmb_render_pipeline_new(NmbDevice *, const struct NmbRenderPipelineDescriptor *);
 /* Descriptor binaryArchives and MTLPipelineOption bits. NULL options means defaults.
@@ -155,6 +174,8 @@ struct NmbComputePipelineDescriptor {
     NmbFunction *function;
     uint64_t max_threads, multiple_of_execution_width, indirect, max_call_stack_depth, adding_binary_functions;
     uint64_t mutability[31];
+    NmbFunction *const *linked;uint64_t linked_count;
+    NmbFunction *const *private_linked;uint64_t private_linked_count;
 };
 NmbComputePipeline *nmb_compute_pipeline_new_with_options(NmbDevice *, NmbFunction *, const struct NmbPipelineOptions *);
 NmbComputePipeline *nmb_compute_pipeline_new_with_descriptor(NmbDevice *, const struct NmbComputePipelineDescriptor *, const struct NmbPipelineOptions *);
@@ -164,6 +185,14 @@ bool nmb_binary_archive_add_render(NmbBinaryArchive *, const struct NmbRenderPip
 bool nmb_binary_archive_add_compute(NmbBinaryArchive *, NmbFunction *);
 bool nmb_binary_archive_add_compute_descriptor(NmbBinaryArchive *, const struct NmbComputePipelineDescriptor *);
 void nmb_render_pipeline_release(NmbRenderPipeline *);
+
+// A pipeline's reflection, as its creation's `reflection:` answers it, in JSON: {"vertex":[...],"fragment":[...]} for a render pipeline,
+// {"bindings":[...]} for a compute pipeline; each binding has Metal's raw values and a buffer's nested struct/array/pointer types. Null: refused.
+typedef struct NmbReflection NmbReflection;
+NmbReflection *nmb_render_pipeline_reflection(const struct NmbRenderPipelineDescriptor *);
+NmbReflection *nmb_compute_pipeline_reflection(const struct NmbComputePipelineDescriptor *);
+const char *nmb_reflection_json(const NmbReflection *);
+void nmb_reflection_release(NmbReflection *);
 
 struct NmbSamplerDescriptor {
     uint64_t min_filter, mag_filter, mip_filter, s_address, t_address, r_address, border_color, normalized, max_anisotropy, compare, lod_average;
@@ -237,6 +266,11 @@ struct NmbRenderPassDescriptor {
     NmbBuffer *visibility; /* the pass's visibility result buffer, or null */
 };
 NmbEncoder *nmb_render_encoder_new(NmbCommandBuffer *, const struct NmbRenderPassDescriptor *);
+struct NmbRenderPass;
+/* Own actual runtime Texture/Buffer references before deferred encoding. */
+struct NmbRenderPass *nmb_render_pass_new(const struct NmbRenderPassDescriptor *);
+void nmb_render_pass_release(struct NmbRenderPass *);
+NmbEncoder *nmb_render_encoder_new_from_pass(NmbCommandBuffer *,const struct NmbRenderPass *);
 bool nmb_encoder_end(NmbEncoder *);
 void nmb_encoder_discard(NmbEncoder *);
 
@@ -297,11 +331,31 @@ uint32_t nmb_function_constant_count(const NmbFunction *);
 size_t nmb_function_constant_name_size(const NmbFunction *, uint32_t at);
 bool nmb_function_constant_at(const NmbFunction *, uint32_t at, char *name, size_t capacity, uint64_t *index, uint64_t *data_type, bool *required);
 bool nmb_render_set_viewports(NmbEncoder *, const double *values, size_t count);
+/* One pair of uint32_t offsets per view; NULL retains Metal's zero-offset mappings. */
+bool nmb_render_set_vertex_amplification(NmbEncoder *, uint64_t count, const uint32_t *mappings);
+uint64_t nmb_function_patch_type(const NmbFunction *);
+int64_t nmb_function_patch_control_point_count(const NmbFunction *);
+bool nmb_compute_dispatch_indirect(NmbEncoder *,NmbBuffer *,uint64_t,const uint64_t per_group[3]);
+bool nmb_render_set_tessellation_factor_buffer(NmbEncoder *,NmbBuffer *,uint64_t,uint64_t);
+bool nmb_render_set_tessellation_factor_scale(NmbEncoder *,float);
+bool nmb_render_draw_patches(NmbEncoder *,uint32_t,uint32_t,uint32_t,NmbBuffer *,uint64_t,NmbBuffer *,uint64_t,uint32_t,uint32_t,NmbBuffer *,uint64_t);
+uint64_t nmb_command_buffer_metal_error_code(const NmbCommandBuffer *);
 bool nmb_render_set_scissors(NmbEncoder *, const uint64_t *values, size_t count);
 bool nmb_function_set_specialized_name(NmbFunction *, const char *);
 NmbQueue *nmb_queue_new_with_max_command_buffer_count(NmbDevice *, size_t);
 uint64_t nmb_command_buffer_diagnostic_id(const NmbCommandBuffer *buffer);
 void nmb_gpu_diagnostic_hook(void (*hook)(uint32_t,uint64_t,uint64_t,uint64_t));
+
+typedef struct NmbArgumentEncoder NmbArgumentEncoder;
+NmbArgumentEncoder *nmb_function_argument_encoder(const NmbFunction *, uint32_t);
+void nmb_argument_encoder_release(NmbArgumentEncoder *);
+uint64_t nmb_argument_encoder_size(const NmbArgumentEncoder *, bool alignment);
+bool nmb_argument_encoder_target(NmbArgumentEncoder *, const NmbBuffer *, uint64_t offset, uint64_t element);
+bool nmb_argument_encoder_buffer(const NmbArgumentEncoder *, const NmbBuffer *, uint64_t offset, uint32_t);
+bool nmb_argument_encoder_texture(const NmbArgumentEncoder *, const NmbTexture *, uint32_t);
+bool nmb_argument_encoder_sampler(const NmbArgumentEncoder *, const NmbSampler *, uint32_t);
+void *nmb_argument_encoder_constant(const NmbArgumentEncoder *, uint32_t);
+NmbArgumentEncoder *nmb_argument_encoder_nested(const NmbArgumentEncoder *, uint32_t);
 #ifdef __cplusplus
 }
 #endif

@@ -5,11 +5,16 @@
 #include <mach-o/loader.h>
 static void pongQuartzCore18DisplayPolicy()
 {
-#if PONG_GUEST_22H374
+#if PONG_GUEST_DARWIN24 || PONG_GUEST_22H374 || PONG_GUEST_22G100
     if(strcmp(getprogname(),"backboardd"))return;
+    // The actual Pong scanout consumes eight-bit SDR BGRA. Keep these
+    // named runtime options on the native phone target as well. The older
+    // cache's writable option-table addresses below remain UUID-scoped.
     setenv("CA_ALLOW_EDR_MIRRORING","0",1);
     setenv("CA_FORCE_FP16_FRAMEBUFFER","0",1);
     setenv("CA_DISPLAY_EDR_HEADROOM","1",1);
+#endif
+#if PONG_GUEST_22H374
     const uint8_t uuid[16]={0xfa,0xf7,0xd7,0xea,0x18,0xf0,0x3c,0x2d,
                            0x81,0x6c,0xac,0x56,0xd1,0x6c,0x40,0xa3};
     for(uint32_t i=0;i<_dyld_image_count();++i) {
