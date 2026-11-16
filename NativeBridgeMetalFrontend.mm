@@ -16,9 +16,11 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <condition_variable>
 #include <cstring>
 #include <mutex>
 #include <map>
+#include <set>
 #include <tuple>
 #include <pthread.h>
 #include <string>
@@ -246,6 +248,27 @@ NB_RESOURCE_SPI(buffer)
 // lock because freeing a BO may wait for GPU retirement.
 static NSMapTable<NSValue *,NBBuffer *> *gSurfaceImports;
 static std::mutex gSurfaceImportLock;
+using SurfaceImportIdentity=std::tuple<uint64_t,uint64_t,uint64_t>;
+static auto &gSurfaceImportsPending=*new std::set<SurfaceImportIdentity>;
+static auto &gSurfaceImportReady=*new std::condition_variable;
+static uint64_t gSurfaceImportTrimEpoch;
+
+struct PendingSurfaceImport {
+ const SurfaceImportIdentity &identity;
+ std::unique_lock<std::mutex> &lock;
+ bool active=false;
+
+ void finish() {
+  if(!active)return;
+  if(!lock.owns_lock())lock.lock();
+  gSurfaceImportsPending.erase(identity);
+  active=false;
+  lock.unlock();
+  gSurfaceImportReady.notify_all();
+ }
+ ~PendingSurfaceImport(){finish();}
+};
+
 struct HeldImport {NBBuffer *buffer;uint64_t usedUs,bytes;};
 static auto &gHeldImports=*new std::map<std::tuple<uint64_t,uint64_t,uint64_t>,HeldImport>;
 static void pruneHeldImports(bool all,std::vector<NBBuffer *> &gone) {
@@ -264,7 +287,11 @@ static void pruneHeldImports(bool all,std::vector<NBBuffer *> &gone) {
 }
 static void trimHeldImports(bool all) {
  std::vector<NBBuffer *> gone;
- {std::lock_guard<std::mutex> lock(gSurfaceImportLock);pruneHeldImports(all,gone);}
+ {
+  std::lock_guard<std::mutex> lock(gSurfaceImportLock);
+  if(all)++gSurfaceImportTrimEpoch;
+  pruneHeldImports(all,gone);
+ }
 }
 static bool trimOnDeviceMemoryFailure() {
  // Device VA can be exhausted before the OS raises system memory pressure.
@@ -296,22 +323,54 @@ static void watchImportPressure() {
  });
 }
 static void holdImport(uint64_t identity,uint64_t address,uint64_t bytes,NBBuffer *buffer,std::vector<NBBuffer *> &gone) {
- gHeldImports[{identity,address,bytes}]={buffer,nowUs(),bytes};pruneHeldImports(false,gone);
+ auto &held=gHeldImports[{identity,address,bytes}];
+ if(held.buffer && held.buffer!=buffer)gone.push_back(held.buffer);
+ held={buffer,nowUs(),bytes};pruneHeldImports(false,gone);
 }
+static void writeProducerReceipt(char *line);
 static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
  struct Key {uint64_t identity,address,bytes;};
  const Key value={IOSurfaceGetID(surface),(uintptr_t)base,bytes};
  NSValue *key=value.identity?[NSValue valueWithBytes:&value objCType:@encode(Key)]:nil;
+ const SurfaceImportIdentity identity{value.identity,value.address,value.bytes};
  std::vector<NBBuffer *> gone; // declared before the lock: release after unlock
- std::lock_guard<std::mutex> lock(gSurfaceImportLock);
+ NBBuffer *buffer=nil;
+ std::unique_lock<std::mutex> lock(gSurfaceImportLock);
  if(!gSurfaceImports)gSurfaceImports=[NSMapTable strongToWeakObjectsMapTable];
- NBBuffer *buffer=key?[gSurfaceImports objectForKey:key]:nil;
- if(buffer){if(key)holdImport(value.identity,value.address,value.bytes,buffer,gone);return buffer;}
+ PendingSurfaceImport pending{identity,lock};
+ if(key)for(;;) {
+  buffer=[gSurfaceImports objectForKey:key];
+  if(buffer) {
+   holdImport(value.identity,value.address,value.bytes,buffer,gone);
+   return buffer;
+  }
+  // Only callers importing this same live surface wait. Cached and new
+  // unrelated imports can proceed while the kernel wires these pages.
+  if(gSurfaceImportsPending.insert(identity).second) {
+   pending.active=true;
+   break;
+  }
+  gSurfaceImportReady.wait(lock);
+ }
+ const uint64_t trimEpoch=gSurfaceImportTrimEpoch;
+ lock.unlock();
+
  // The surface keeps its CPU mapping (the imported pages) until the import is freed.
+ buffer=[NBBuffer new];
+ if(!buffer)return nil;
+ const uint64_t began=nowUs();
  NmbBuffer *handle=nmb_buffer_new_no_copy_releasing(gDevice,base,bytes,MTLResourceStorageModeShared,releaseSurface,(void *)CFRetain(surface));
- if(!handle){CFRelease(surface);NBLOG(@"native-metal: surface import refused: %@",lastError());return nil;}
- gSurfaceImportsMade++;buffer=[NBBuffer new];buffer.handle=handle;buffer.options=MTLResourceStorageModeShared;buffer.wrapped=base;
+ const uint64_t importUs=nowUs()-began;
+ if(!handle) {
+  pending.finish();
+  CFRelease(surface);
+  NBLOG(@"native-metal: surface import refused: %@",lastError());
+  return nil;
+ }
+ buffer.handle=handle;buffer.options=MTLResourceStorageModeShared;buffer.wrapped=base;
+ gSurfaceImportsMade++;
  if(key) {
+  lock.lock();
   // Bound metadata without retaining old frames. Evicting an association is
   // harmless: its owners still retain the actual import until their own end.
   if(gSurfaceImports.count>=256) {
@@ -320,7 +379,21 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
    if(gSurfaceImports.count>=256)[gSurfaceImports removeObjectForKey:gSurfaceImports.keyEnumerator.nextObject];
   }
   [gSurfaceImports setObject:buffer forKey:key];
-  holdImport(value.identity,value.address,value.bytes,buffer,gone);
+  if(trimEpoch==gSurfaceImportTrimEpoch)
+   holdImport(value.identity,value.address,value.bytes,buffer,gone);
+  pending.finish();
+ }
+ if(bytes==18841600 || bytes==18432000) {
+  const char *process=getprogname();
+  static std::atomic<unsigned> reports[2]{};
+  auto &reported=reports[bytes==18432000?0:1];
+  if(process && !strcmp(process,"backboardd") && reported.fetch_add(1,std::memory_order_relaxed)<12) {
+   char line[256]={};
+   snprintf(line,sizeof(line),"Pong Metal: handoff surface import sid=%u host_va=0x%llx gpu_va=0x%llx bytes=%zu width=%zu height=%zu row=%zu import_us=%llu",
+    IOSurfaceGetID(surface),(unsigned long long)value.address,(unsigned long long)nmb_buffer_gpu_address(handle),bytes,
+    IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),IOSurfaceGetBytesPerRow(surface),(unsigned long long)importUs);
+   writeProducerReceipt(line);
+  }
  }
  return buffer;
 }
@@ -518,13 +591,28 @@ static void flushSurfaces(NSMutableSet *surfaces,const HostRanges &kernelSynced)
   }
   merged.push_back(*it);
  }
+ // Several exact kernel replies can together cover the merged surface
+ // range. Keep the whole fallback when any part lacks confirmed coverage.
+ HostRanges confirmed=kernelSynced;
+ std::sort(confirmed.begin(),confirmed.end());
+ size_t count=0;
+ for(const auto &range:confirmed) {
+  if(!range.first || !range.second || range.second>UINT64_MAX-range.first)continue;
+  if(count) {
+   auto &previous=confirmed[count-1];
+   const uint64_t end=previous.first+previous.second;
+   if(range.first<=end){previous.second=std::max(end,range.first+range.second)-previous.first;continue;}
+  }
+  confirmed[count++]=range;
+ }
+ confirmed.resize(count);
  for(const auto &range:merged) {
   // Only omit the user VA flush when this exact phase successfully
-  // maintained a retained physical import covering the entire surface.
+  // maintained retained physical imports covering the entire range.
   // NotFound/unsupported, copied backings and uncovered ranges retain the
   // conservative path. Kernel physical maintenance includes CPU aliases.
   bool covered=false;
-  for(const auto &synced:kernelSynced)
+  for(const auto &synced:confirmed)
    if(range.first>=synced.first && range.second<=synced.second &&
       range.first-synced.first<=synced.second-range.second){covered=true;break;}
   if(covered)continue;
