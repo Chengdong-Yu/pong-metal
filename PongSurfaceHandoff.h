@@ -30,11 +30,32 @@ static kern_return_t handoff(mach_port_t right,bool end,bool failed) {
     const uint64_t input[]={right,end?1u:0u,failed?1u:0u};
     return call(connection,0x504f4701u,input,3,nullptr,nullptr);
 }
-static void complete(std::vector<mach_port_t> &rights,bool failed) {
-    for(auto right:rights){(void)handoff(right,true,failed);mach_port_deallocate(mach_task_self(),right);}
+struct HeldSurface {
+    mach_port_t right;
+    uint32_t sid;
+};
+struct EndFailure {
+    kern_return_t status=0;
+    uint32_t sid=0;
+    size_t count=0;
+};
+static EndFailure complete(std::vector<HeldSurface> &rights,bool failed) {
+    EndFailure failure;
+    for(const auto &held:rights) {
+        const kern_return_t result=handoff(held.right,true,failed);
+        if(result) {
+            if(!failure.count) {
+                failure.status=result;
+                failure.sid=held.sid;
+            }
+            ++failure.count;
+        }
+        mach_port_deallocate(mach_task_self(),held.right);
+    }
     rights.clear();
+    return failure;
 }
-static bool begin(NSMutableSet *textures,std::vector<mach_port_t> &rights) {
+static bool begin(NSMutableSet *textures,std::vector<HeldSurface> &rights) {
     std::vector<std::pair<uint32_t,IOSurfaceRef>> unique;
     for(id texture in textures) {
         IOSurfaceRef surface=[texture iosurface];
@@ -49,7 +70,7 @@ static bool begin(NSMutableSet *textures,std::vector<mach_port_t> &rights) {
             if(!right){result=0xe00002bd;break;}
             result=handoff(right,false,false);
             if(result){mach_port_deallocate(mach_task_self(),right);break;}
-            rights.push_back(right);
+            rights.push_back({right,entry.first});
         }
         if(!result)return true;
         // No partial acquisition waits on another surface. This avoids
