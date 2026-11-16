@@ -15,9 +15,12 @@
 #import <objc/message.h>
 #include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <condition_variable>
 #include <cstring>
 #include <mutex>
 #include <map>
+#include <set>
 #include <tuple>
 #include <pthread.h>
 #include <string>
@@ -245,6 +248,27 @@ NB_RESOURCE_SPI(buffer)
 // lock because freeing a BO may wait for GPU retirement.
 static NSMapTable<NSValue *,NBBuffer *> *gSurfaceImports;
 static std::mutex gSurfaceImportLock;
+using SurfaceImportIdentity=std::tuple<uint64_t,uint64_t,uint64_t>;
+static auto &gSurfaceImportsPending=*new std::set<SurfaceImportIdentity>;
+static auto &gSurfaceImportReady=*new std::condition_variable;
+static uint64_t gSurfaceImportTrimEpoch;
+
+struct PendingSurfaceImport {
+ const SurfaceImportIdentity &identity;
+ std::unique_lock<std::mutex> &lock;
+ bool active=false;
+
+ void finish() {
+  if(!active)return;
+  if(!lock.owns_lock())lock.lock();
+  gSurfaceImportsPending.erase(identity);
+  active=false;
+  lock.unlock();
+  gSurfaceImportReady.notify_all();
+ }
+ ~PendingSurfaceImport(){finish();}
+};
+
 struct HeldImport {NBBuffer *buffer;uint64_t usedUs,bytes;};
 static auto &gHeldImports=*new std::map<std::tuple<uint64_t,uint64_t,uint64_t>,HeldImport>;
 static void pruneHeldImports(bool all,std::vector<NBBuffer *> &gone) {
@@ -263,7 +287,11 @@ static void pruneHeldImports(bool all,std::vector<NBBuffer *> &gone) {
 }
 static void trimHeldImports(bool all) {
  std::vector<NBBuffer *> gone;
- {std::lock_guard<std::mutex> lock(gSurfaceImportLock);pruneHeldImports(all,gone);}
+ {
+  std::lock_guard<std::mutex> lock(gSurfaceImportLock);
+  if(all)++gSurfaceImportTrimEpoch;
+  pruneHeldImports(all,gone);
+ }
 }
 static bool trimOnDeviceMemoryFailure() {
  // Device VA can be exhausted before the OS raises system memory pressure.
@@ -295,22 +323,54 @@ static void watchImportPressure() {
  });
 }
 static void holdImport(uint64_t identity,uint64_t address,uint64_t bytes,NBBuffer *buffer,std::vector<NBBuffer *> &gone) {
- gHeldImports[{identity,address,bytes}]={buffer,nowUs(),bytes};pruneHeldImports(false,gone);
+ auto &held=gHeldImports[{identity,address,bytes}];
+ if(held.buffer && held.buffer!=buffer)gone.push_back(held.buffer);
+ held={buffer,nowUs(),bytes};pruneHeldImports(false,gone);
 }
+static void writeProducerReceipt(char *line);
 static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
  struct Key {uint64_t identity,address,bytes;};
  const Key value={IOSurfaceGetID(surface),(uintptr_t)base,bytes};
  NSValue *key=value.identity?[NSValue valueWithBytes:&value objCType:@encode(Key)]:nil;
+ const SurfaceImportIdentity identity{value.identity,value.address,value.bytes};
  std::vector<NBBuffer *> gone; // declared before the lock: release after unlock
- std::lock_guard<std::mutex> lock(gSurfaceImportLock);
+ NBBuffer *buffer=nil;
+ std::unique_lock<std::mutex> lock(gSurfaceImportLock);
  if(!gSurfaceImports)gSurfaceImports=[NSMapTable strongToWeakObjectsMapTable];
- NBBuffer *buffer=key?[gSurfaceImports objectForKey:key]:nil;
- if(buffer){if(key)holdImport(value.identity,value.address,value.bytes,buffer,gone);return buffer;}
+ PendingSurfaceImport pending{identity,lock};
+ if(key)for(;;) {
+  buffer=[gSurfaceImports objectForKey:key];
+  if(buffer) {
+   holdImport(value.identity,value.address,value.bytes,buffer,gone);
+   return buffer;
+  }
+  // Only callers importing this same live surface wait. Cached and new
+  // unrelated imports can proceed while the kernel wires these pages.
+  if(gSurfaceImportsPending.insert(identity).second) {
+   pending.active=true;
+   break;
+  }
+  gSurfaceImportReady.wait(lock);
+ }
+ const uint64_t trimEpoch=gSurfaceImportTrimEpoch;
+ lock.unlock();
+
  // The surface keeps its CPU mapping (the imported pages) until the import is freed.
+ buffer=[NBBuffer new];
+ if(!buffer)return nil;
+ const uint64_t began=nowUs();
  NmbBuffer *handle=nmb_buffer_new_no_copy_releasing(gDevice,base,bytes,MTLResourceStorageModeShared,releaseSurface,(void *)CFRetain(surface));
- if(!handle){CFRelease(surface);NBLOG(@"native-metal: surface import refused: %@",lastError());return nil;}
- gSurfaceImportsMade++;buffer=[NBBuffer new];buffer.handle=handle;buffer.options=MTLResourceStorageModeShared;buffer.wrapped=base;
+ const uint64_t importUs=nowUs()-began;
+ if(!handle) {
+  pending.finish();
+  CFRelease(surface);
+  NBLOG(@"native-metal: surface import refused: %@",lastError());
+  return nil;
+ }
+ buffer.handle=handle;buffer.options=MTLResourceStorageModeShared;buffer.wrapped=base;
+ gSurfaceImportsMade++;
  if(key) {
+  lock.lock();
   // Bound metadata without retaining old frames. Evicting an association is
   // harmless: its owners still retain the actual import until their own end.
   if(gSurfaceImports.count>=256) {
@@ -319,7 +379,21 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
    if(gSurfaceImports.count>=256)[gSurfaceImports removeObjectForKey:gSurfaceImports.keyEnumerator.nextObject];
   }
   [gSurfaceImports setObject:buffer forKey:key];
-  holdImport(value.identity,value.address,value.bytes,buffer,gone);
+  if(trimEpoch==gSurfaceImportTrimEpoch)
+   holdImport(value.identity,value.address,value.bytes,buffer,gone);
+  pending.finish();
+ }
+ if(bytes==18841600 || bytes==18432000) {
+  const char *process=getprogname();
+  static std::atomic<unsigned> reports[2]{};
+  auto &reported=reports[bytes==18432000?0:1];
+  if(process && !strcmp(process,"backboardd") && reported.fetch_add(1,std::memory_order_relaxed)<12) {
+   char line[256]={};
+   snprintf(line,sizeof(line),"Pong Metal: handoff surface import sid=%u host_va=0x%llx gpu_va=0x%llx bytes=%zu width=%zu height=%zu row=%zu import_us=%llu",
+    IOSurfaceGetID(surface),(unsigned long long)value.address,(unsigned long long)nmb_buffer_gpu_address(handle),bytes,
+    IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),IOSurfaceGetBytesPerRow(surface),(unsigned long long)importUs);
+   writeProducerReceipt(line);
+  }
  }
  return buffer;
 }
@@ -490,6 +564,11 @@ NB_RESOURCE_SPI(texture)
 // or command, and distinct/partially overlapping ranges retain their calls.
 #include "PongSurfaceHandoff.h"
 using HostRanges=std::vector<std::pair<uint64_t,uint64_t>>;
+struct SyncFailure {
+ int32_t status=0;
+ const char *operation="-";
+ size_t index=0,count=0;
+};
 static void flushSurfaces(NSMutableSet *surfaces,const HostRanges &kernelSynced) {
  if(!surfaces.count)return;
  std::vector<std::pair<uintptr_t,size_t>> ranges;
@@ -512,13 +591,28 @@ static void flushSurfaces(NSMutableSet *surfaces,const HostRanges &kernelSynced)
   }
   merged.push_back(*it);
  }
+ // Several exact kernel replies can together cover the merged surface
+ // range. Keep the whole fallback when any part lacks confirmed coverage.
+ HostRanges confirmed=kernelSynced;
+ std::sort(confirmed.begin(),confirmed.end());
+ size_t count=0;
+ for(const auto &range:confirmed) {
+  if(!range.first || !range.second || range.second>UINT64_MAX-range.first)continue;
+  if(count) {
+   auto &previous=confirmed[count-1];
+   const uint64_t end=previous.first+previous.second;
+   if(range.first<=end){previous.second=std::max(end,range.first+range.second)-previous.first;continue;}
+  }
+  confirmed[count++]=range;
+ }
+ confirmed.resize(count);
  for(const auto &range:merged) {
   // Only omit the user VA flush when this exact phase successfully
-  // maintained a retained physical import covering the entire surface.
+  // maintained retained physical imports covering the entire range.
   // NotFound/unsupported, copied backings and uncovered ranges retain the
   // conservative path. Kernel physical maintenance includes CPU aliases.
   bool covered=false;
-  for(const auto &synced:kernelSynced)
+  for(const auto &synced:confirmed)
    if(range.first>=synced.first && range.second<=synced.second &&
       range.first-synced.first<=synced.second-range.second){covered=true;break;}
   if(covered)continue;
@@ -531,7 +625,8 @@ static void flushSurfaces(NSMutableSet *surfaces,const HostRanges &kernelSynced)
 // matches full live import extents and keeps the old policy for every other
 // buffer. Phase1 is issued only after actual runtime completion, before
 // CPU/display ownership is returned; other imports remain conservative.
-static bool syncActiveImports(NSMutableSet *surfaces,NSMutableSet *owners,uint32_t phase,HostRanges &kernelSynced) {
+static bool syncActiveImports(NSMutableSet *surfaces,NSMutableSet *owners,uint32_t phase,
+ HostRanges &kernelSynced,SyncFailure *failure=nullptr) {
  using Sync=int32_t(*)(uint64_t,uint64_t,uint32_t);
  using Batch=int32_t(*)(const uint64_t *,uint32_t,uint32_t,uint64_t *);
  static std::atomic<Sync> cached{nullptr};Sync fn=cached.load();
@@ -566,18 +661,25 @@ static bool syncActiveImports(NSMutableSet *surfaces,NSMutableSet *owners,uint32
   for(unsigned i=0;i<count;++i){words[2*i]=ranges[first+i].first;words[2*i+1]=ranges[first+i].second;}
   const int32_t result=batch(words,count,phase,&covered);
   if(uint32_t(result)==0xe00002c7u) {batch=nullptr;break;} // older negotiated ABI: retain method19
-  if(result){NBLOG(@"native-metal: batched host ownership sync refused: 0x%x",uint32_t(result));return false;}
+  if(result) {
+   if(failure)*failure={result,"batch",first,count};
+   NBLOG(@"native-metal: batched host ownership sync refused: 0x%x",uint32_t(result));
+   return false;
+  }
   for(unsigned i=0;i<count;++i)if(covered&(UINT64_C(1)<<i))kernelSynced.push_back(ranges[first+i]);
  }
  if(batch)return true;
- for(const auto &range:ranges) {
+ for(size_t i=0;i<ranges.size();++i) {
+  const auto &range=ranges[i];
   const int32_t result=fn(range.first,range.second,phase);
   if(!result)kernelSynced.push_back(range);
   // No matching host import means the runtime used an owned/copy backing,
   // which still receives its normal kernel maintenance. Any real failure
   // refuses this command; do not silently omit a required publication.
   if(result && uint32_t(result)!=0xe00002c7u && uint32_t(result)!=0xe00002f0u) {
-   NBLOG(@"native-metal: host ownership sync refused: 0x%x",uint32_t(result));return false;
+   if(failure)*failure={result,"range",i,1};
+   NBLOG(@"native-metal: host ownership sync refused: 0x%x",uint32_t(result));
+   return false;
   }
  }
  return true;
@@ -903,13 +1005,79 @@ static void notified(void *context,uint64_t value) {
 - (void)dealloc {nmb_fence_release(_handle);}
 @end
 
+// Extract a short runtime explanation without including addresses from debug text.
+static void producerRuntimeError(NmbCommandBuffer *handle,char (&answer)[53]) {
+ char raw[512]={};
+ nmb_command_buffer_error(handle,raw,sizeof(raw));
+ raw[sizeof(raw)-1]=0;
+ size_t out=0;
+ for(size_t i=0;raw[i] && out<sizeof(answer)-1;) {
+  const auto value=static_cast<unsigned char>(raw[i]);
+  const bool hex=raw[i]=='0' && (raw[i+1]=='x' || raw[i+1]=='X');
+  if(hex || std::isdigit(value)) {
+   const size_t start=i+(hex?2:0);
+   size_t end=start;
+   while(hex?std::isxdigit(static_cast<unsigned char>(raw[end])):
+      std::isdigit(static_cast<unsigned char>(raw[end])))++end;
+   if(hex || end-start>9) {
+    answer[out++]='?';
+    i=end;
+    continue;
+   }
+  }
+  answer[out++]=value>=0x20 && value<=0x7e?raw[i]:' ';
+  ++i;
+ }
+ answer[out]=0;
+}
+
+static void writeProducerReceipt(char *line) {
+ size_t mibCount=CTL_MAXNAME;
+ int mib[CTL_MAXNAME];
+ if(!sysctlnametomib("kern.pong_diagnostic",mib,&mibCount))
+  (void)sysctl(mib,static_cast<u_int>(mibCount),nullptr,nullptr,line,strlen(line));
+}
+
+static void reportProducerFailure(NmbCommandBuffer *handle,uint32_t commit,MTLCommandBufferStatus status,
+ const std::vector<pongsurface::HeldSurface> &held,const SyncFailure &sync,
+ const pongsurface::EndFailure &release={}) {
+ if(held.empty() && !release.count)return;
+ static std::atomic<unsigned> reports{0};
+ if(reports.fetch_add(1,std::memory_order_relaxed)>=8)return;
+
+ char sids[67]="-";
+ size_t used=0;
+ for(const auto &surface:held) {
+  const int appended=snprintf(sids+used,sizeof(sids)-used,"%s%u",used?",":"",surface.sid);
+  if(appended<0 || static_cast<size_t>(appended)>=sizeof(sids)-used) {
+   sids[used]=0;
+   break;
+  }
+  used+=static_cast<size_t>(appended);
+ }
+
+ char error[53]="-";
+ if(!release.count && !sync.status)producerRuntimeError(handle,error);
+ char line[256]={};
+ if(release.count) {
+  snprintf(line,sizeof(line),"Pong Metal: handoff failure stage=release cb=%u st=%u rc=0x%08x sid=%u errors=%zu",
+   commit,unsigned(status),uint32_t(release.status),release.sid,release.count);
+ } else {
+  snprintf(line,sizeof(line),
+   "Pong Metal: handoff failure stage=%s cb=%u st=%u rc=0x%08x op=%s idx=%zu n=%zu held=%zu sids=%s err=%s",
+   sync.status?"acquire":"runtime",commit,unsigned(status),uint32_t(sync.status),sync.operation,
+   sync.index,sync.count,held.size(),sids,error[0]?error:"-");
+ }
+ writeProducerReceipt(line);
+}
+
 // ---- command buffers and encoders ----
 @interface NBQueue : NBObject {NBQueuePriorities::Request _priority;}
 @property(nonatomic) NmbQueue *handle;
 @property(atomic,strong) dispatch_queue_t completionQueue;   // SPI: where command buffers' handlers run (nil: the runtime's thread)
 @end
 @interface NBCommandBuffer : NBObject {
- std::vector<mach_port_t> displayHandoffs;
+ std::vector<pongsurface::HeldSurface> displayHandoffs;
 @public
  EncodedWork encodedWork;   // the command buffer's single encoder thread, not global counter deltas
  uint64_t createdUs,traceNumber;
@@ -1408,6 +1576,28 @@ static void captureFrameSurfaces(NBCommandBuffer *cb) {
  if(ok){++taken;captureColour(surface,h.capture);}last=now;
 }
 
+static bool allowDrawablePresentation(id<MTLCommandBuffer> completedBuffer)
+{
+ const MTLCommandBufferStatus status=completedBuffer.status;
+ if(status==MTLCommandBufferStatusCompleted)return true;
+
+ // A local refusal can occur before obtaining IOSurface rights. Give
+ // skipped presentation its own small receipt budget.
+ static std::atomic<unsigned> skippedReceipts{0};
+ if(skippedReceipts.fetch_add(1,std::memory_order_relaxed)<8) {
+  NBCommandBuffer *command=(NBCommandBuffer *)completedBuffer;
+  const char *stage=command.completionSyncFailed?"host-acquire":command.failedLocally?"local":"runtime";
+  char detail[53]="-";
+  if(!command.failedLocally && !command.completionSyncFailed)
+   producerRuntimeError(command.handle,detail);
+  char line[220];
+  snprintf(line,sizeof(line),"Pong Metal: handoff present skipped cb=%u st=%u stage=%s err=%s",
+   command.commitIndex,unsigned(status),stage,detail[0]?detail:"-");
+  writeProducerReceipt(line);
+ }
+ return false;
+}
+
 @implementation NBCommandBuffer
 // Upstream 0f11e64: MPS stores per-command state here on Darwin24 too.
 static char kUserDictionaryKey;
@@ -1590,9 +1780,18 @@ static char kUserDictionaryKey;
 }
 - (void)addScheduledHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_scheduledHandlers addObject:[block copy]];}}
 - (void)addCompletedHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_completedHandlers addObject:[block copy]];}}
-// A drawable (RenderBox's CAMetalLayer path) is presented once the GPU has written it: this runtime's scheduling comes before completion.
-- (void)presentDrawable:(id<MTLDrawable>)drawable {[self addCompletedHandler:^(id<MTLCommandBuffer>){[drawable present];}];}
-- (void)presentDrawable:(id<MTLDrawable>)drawable atTime:(CFTimeInterval)time {[self addCompletedHandler:^(id<MTLCommandBuffer>){[drawable presentAtTime:time];}];}
+// Completion handlers also run when encoding, submission or host acquire
+// fails. Publish only after a completed command buffer.
+- (void)presentDrawable:(id<MTLDrawable>)drawable {
+ [self addCompletedHandler:^(id<MTLCommandBuffer> command){
+  if(allowDrawablePresentation(command))[drawable present];
+ }];
+}
+- (void)presentDrawable:(id<MTLDrawable>)drawable atTime:(CFTimeInterval)time {
+ [self addCompletedHandler:^(id<MTLCommandBuffer> command){
+  if(allowDrawablePresentation(command))[drawable presentAtTime:time];
+ }];
+}
 - (void)enqueue {}
 - (void)event:(id<MTLEvent>)event value:(uint64_t)value signal:(bool)signal {
  if(![(id)event isKindOfClass:[NBEvent class]]){[self refuse:@"foreign event"];return;}
@@ -1631,15 +1830,21 @@ static char kUserDictionaryKey;
  // ownership/display callbacks follow it. Imported resources stay retained
  // across both phases. Nonparticipating resources keep kernel maintenance.
  const uint64_t syncBegan=nowUs();HostRanges kernelSynced;
- if(!self.failedLocally && self.status==MTLCommandBufferStatusCompleted &&
-    !syncActiveImports(_surfaces,_resourceOwners,1,kernelSynced)) {
+ const bool submitted=!self.failedLocally;
+ const MTLCommandBufferStatus runtimeStatus=self.status;
+ SyncFailure syncFailure;
+ if(submitted && runtimeStatus==MTLCommandBufferStatusCompleted &&
+    !syncActiveImports(_surfaces,_resourceOwners,1,kernelSynced,&syncFailure)) {
   self.completionSyncFailed=YES;self.encodeFailure=@"completed host-import acquire failed";
  }
  const uint64_t flushBegan=nowUs();flushSurfaces(_surfaces,kernelSynced);
  frameEvent(61,traceNumber,1,flushBegan-syncBegan,nowUs()-flushBegan,_surfaces.count,_resourceOwners.count,kernelSynced.size());
  [self tracePhase:3];
  if(!self.failedLocally && self.status==MTLCommandBufferStatusCompleted)captureFrameSurfaces(self);
- pongsurface::complete(displayHandoffs,self.completionSyncFailed || (!self.failedLocally && self.status!=MTLCommandBufferStatusCompleted));
+ const bool failed=self.completionSyncFailed || (!self.failedLocally && self.status!=MTLCommandBufferStatusCompleted);
+ if(failed)reportProducerFailure(_handle,self.commitIndex,runtimeStatus,displayHandoffs,syncFailure);
+ const auto release=pongsurface::complete(displayHandoffs,failed);
+ if(release.count)reportProducerFailure(_handle,self.commitIndex,runtimeStatus,displayHandoffs,syncFailure,release);
  // Actual GPU completion (or a local refusal that never submitted) is the
  // release point. A retained completed command must not pin every old frame.
  [_surfaces removeAllObjects];[_resourceOwners removeAllObjects];
